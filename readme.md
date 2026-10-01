@@ -69,11 +69,19 @@ Avec plus de coeurs et de thread malgré une efficacité beaucoup moins grande e
 
 **<u>Conclusion :</u>** En mono thread le portable écrase le fixe, mais le portable profite assez peu du MT massif car son parallélisme devient moins efficient à cause principalement de latence de l'accès mémoire sur ces cribles qui sont très gourmands en MT.
 
+# La version améliorée
 
+Pour le 10e10 nombre premiers.
 
+## Sur le portable
 
+252097800623, 89.735s, 1 cœur / 1 thread
+252097800623, 50.518s, 1 cœur / 2 threads
+252097800623, 19.899s, 8 cœurs / 8 threads
+252097800623, 15.811s, 8 cœurs / 16 threads
+252097800623, 16.200s, 8 cœurs / 16 threads (maximum)
 
-
+## Sur le fixe
 
 
 

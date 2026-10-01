@@ -1,10 +1,18 @@
-//! Recherche du n-ième nombre premier (crible segmenté parallèle).
+//! Recherche du n-ième nombre premier (crible segmenté parallèle, impairs + bitset).
 //!
-//! Usage : nth_prime <n> <config>
+//! Usage : burn_prems <n> <config>      (n accepte les séparateurs `_` : 10_000_000)
 //!   config = 0      : tous les cœurs et tous les threads disponibles
 //!   config = XY     : X cœurs, Y threads par cœur (ex. 11, 12, 21, 22, 42...)
 //!
 //! Sortie : "<premier>, <durée>s, <configuration>"
+//!
+//! Optimisations (v3) :
+//!  - pré-crible : les multiples de 3, 5, 7, 11, 13 sont posés d'un coup en recopiant un motif
+//!    périodique (période 15015 bits) au lieu d'être marqués un par un ;
+//! Optimisations (v2) :
+//!  - seuls les nombres impairs sont représentés (l'indice k ↔ le nombre 2k+1) ;
+//!  - un bit par nombre (au lieu d'un octet) : 16× moins de mémoire par plage ;
+//!  - segments de 64 Kio, qui tiennent dans le cache L2 (et ne polluent pas le L1 des voisins).
 
 use std::collections::BTreeSet;
 use std::env;
@@ -15,8 +23,25 @@ use std::time::Instant;
 
 use core_affinity::CoreId;
 
-/// Taille d'un segment de crible (1 Mio de booléens, tient dans le cache L2).
-const SEGMENT: u64 = 1 << 20;
+/// Petits premiers impairs traités par pré-crible (motif périodique).
+const PRE: [u64; 5] = [3, 5, 7, 11, 13];
+
+const fn produit(l: &[u64]) -> usize {
+    let mut i = 0;
+    let mut r = 1usize;
+    while i < l.len() {
+        r *= l[i] as usize;
+        i += 1;
+    }
+    r
+}
+
+/// Période du motif, en indices d'impairs : 3·5·7·11·13 = 15015.
+const PERIODE: usize = produit(&PRE);
+
+/// Taille de segment par défaut : 2^19 impairs = 2^19 bits = 64 Kio (2^20 nombres couverts).
+/// Modifiable à l'exécution avec la variable d'environnement SEG_LOG2 (exposant, 14..=26).
+const SEG_LOG2_DEFAUT: u32 = 19;
 
 // ---------------------------------------------------------------------------
 // Topologie CPU
@@ -127,7 +152,7 @@ fn choisir_cpus(topo: &[Vec<usize>], config: u32) -> Result<(Vec<usize>, String)
 }
 
 // ---------------------------------------------------------------------------
-// Crible
+// Crible (impairs, bitset)
 // ---------------------------------------------------------------------------
 
 /// Majorant de p_n (Rosser) : p_n < n (ln n + ln ln n) pour n ≥ 6.
@@ -140,101 +165,167 @@ fn borne_sup(n: u64) -> u64 {
     }
 }
 
-/// Crible simple de tous les premiers ≤ max.
-fn petits_premiers(max: u64) -> Vec<u64> {
-    let n = max as usize;
-    let mut crible = vec![true; n + 1];
-    crible[0] = false;
-    if n >= 1 {
-        crible[1] = false;
-    }
+/// Tous les premiers impairs ≤ max (crible simple).
+fn petits_premiers_impairs(max: usize) -> Vec<u64> {
+    let mut crible = vec![true; max + 1];
     let mut i = 2;
-    while i * i <= n {
+    while i * i <= max {
         if crible[i] {
             let mut j = i * i;
-            while j <= n {
+            while j <= max {
                 crible[j] = false;
                 j += i;
             }
         }
         i += 1;
     }
-    crible
-        .iter()
-        .enumerate()
-        .filter(|&(_, &p)| p)
-        .map(|(i, _)| i as u64)
-        .collect()
+    (3..=max).filter(|&i| crible[i]).map(|i| i as u64).collect()
 }
 
-/// Crible le segment [lo, hi) ; `tampon[i]` vaut true si lo+i est premier.
-fn cribler(lo: u64, hi: u64, base: &[u64], tampon: &mut Vec<bool>) {
-    tampon.clear();
-    tampon.resize((hi - lo) as usize, true);
-    for &p in base {
-        if p * p >= hi {
-            break;
-        }
-        let mut m = ((lo + p - 1) / p * p).max(p * p);
-        while m < hi {
-            tampon[(m - lo) as usize] = false;
-            m += p;
+/// Motif de pré-crible : le bit i vaut 1 si le nombre 2i+1 est multiple d'un premier de PRE.
+/// Il est périodique de période PERIODE ; on le déroule sur PERIODE + un segment (+ marge)
+/// pour pouvoir le recopier à n'importe quel décalage.
+fn construire_motif(seg_odds: u64) -> Vec<u64> {
+    let nbits = PERIODE + seg_odds as usize + 256;
+    let mut m = vec![0u64; nbits / 64 + 2];
+    let total = m.len() * 64;
+    for &p in PRE.iter() {
+        let mut k = ((p - 1) / 2) as usize;
+        while k < total {
+            m[k >> 6] |= 1u64 << (k & 63);
+            k += p as usize;
         }
     }
-    for v in lo..hi.min(2) {
-        tampon[(v - lo) as usize] = false; // 0 et 1
+    m
+}
+
+/// Crible les impairs d'indices k ∈ [klo, khi) (le nombre est 2k+1).
+/// Après l'appel, un bit à 0 = premier, un bit à 1 = composé (ou bourrage de fin de segment).
+fn cribler(klo: u64, khi: u64, base: &[u64], motif: &[u64], mots: &mut Vec<u64>) {
+    let nbits = (khi - klo) as usize;
+    let nmots = (nbits + 63) / 64;
+    mots.clear();
+    mots.resize(nmots, 0);
+
+    // Pré-crible : recopie du motif décalé de (klo mod PERIODE) bits.
+    let s = (klo % PERIODE as u64) as usize;
+    let (q, r) = (s >> 6, (s & 63) as u32);
+    if r == 0 {
+        mots.copy_from_slice(&motif[q..q + nmots]);
+    } else {
+        let src = &motif[q..q + nmots + 1];
+        for (w, paire) in mots.iter_mut().zip(src.windows(2)) {
+            *w = (paire[0] >> r) | (paire[1] << (64 - r));
+        }
+    }
+    if klo == 0 {
+        // Le motif marque aussi les petits premiers eux-mêmes : on les « démarque ».
+        for &p in PRE.iter() {
+            let k = ((p - 1) / 2) as usize;
+            if k < nbits {
+                mots[k >> 6] &= !(1u64 << (k & 63));
+            }
+        }
+    }
+
+    let lo_num = 2 * klo + 1; // plus petit nombre du segment
+    let hi_num = 2 * khi; // tous les nombres du segment sont < hi_num
+
+    for &p in base {
+        let p2 = p * p;
+        if p2 >= hi_num {
+            break;
+        }
+        // Premier multiple impair de p à marquer : ≥ p² et ≥ lo_num.
+        let m = if p2 >= lo_num {
+            p2
+        } else {
+            let m = (lo_num + p - 1) / p * p;
+            if m % 2 == 0 { m + p } else { m }
+        };
+        let mut i = ((m - 1) / 2 - klo) as usize;
+        let pas = p as usize; // deux impairs consécutifs multiples de p : écart p en indices
+        while i < nbits {
+            // SAFETY : i < nbits ≤ nmots * 64, donc i >> 6 < nmots.
+            unsafe {
+                *mots.get_unchecked_mut(i >> 6) |= 1u64 << (i & 63);
+            }
+            i += pas;
+        }
+    }
+
+    if klo == 0 {
+        mots[0] |= 1; // le nombre 1 n'est pas premier
+    }
+    let reste = nbits & 63;
+    if reste != 0 {
+        mots[nmots - 1] |= !0u64 << reste; // bourrage : bits hors segment = « composés »
     }
 }
 
 /// Calcule le n-ième nombre premier en répartissant les segments sur `cpus`.
-fn nieme_premier(n: u64, cpus: &[usize]) -> u64 {
+fn nieme_premier(n: u64, cpus: &[usize], seg_odds: u64) -> u64 {
+    if n == 1 {
+        return 2;
+    }
     let limite = borne_sup(n);
-    let base = petits_premiers((limite as f64).sqrt() as u64 + 1);
-    let nb_seg = (limite / SEGMENT + 1) as usize;
+    let base: Vec<u64> = petits_premiers_impairs((limite as f64).sqrt() as usize + 1)
+        .into_iter()
+        .filter(|p| !PRE.contains(p)) // déjà traités par le pré-crible
+        .collect();
+    let motif = construire_motif(seg_odds);
+    let total_k = (limite + 1) / 2; // nombre d'impairs ≤ limite
+    let nb_seg = ((total_k + seg_odds - 1) / seg_odds) as usize;
     let compteurs: Vec<AtomicU64> = (0..nb_seg).map(|_| AtomicU64::new(0)).collect();
     let suivant = AtomicUsize::new(0);
 
-    let (base_ref, compteurs_ref, suivant_ref) = (&base, &compteurs, &suivant);
+    let (base_ref, compteurs_ref, suivant_ref, motif_ref) = (&base, &compteurs, &suivant, &motif);
     std::thread::scope(|s| {
         for &cpu in cpus {
             s.spawn(move || {
                 core_affinity::set_for_current(CoreId { id: cpu });
-                let mut tampon = Vec::new();
+                let mut mots = Vec::new();
                 loop {
                     let i = suivant_ref.fetch_add(1, Ordering::Relaxed);
                     if i >= nb_seg {
                         break;
                     }
-                    let lo = i as u64 * SEGMENT;
-                    let hi = ((i as u64 + 1) * SEGMENT).min(limite + 1);
-                    cribler(lo, hi, base_ref, &mut tampon);
-                    let c = tampon.iter().filter(|&&b| b).count() as u64;
-                    compteurs_ref[i].store(c, Ordering::Relaxed);
+                    let klo = i as u64 * seg_odds;
+                    let khi = (klo + seg_odds).min(total_k);
+                    cribler(klo, khi, base_ref, motif_ref, &mut mots);
+                    let premiers: u64 = mots.iter().map(|w| w.count_zeros() as u64).sum();
+                    compteurs_ref[i].store(premiers, Ordering::Relaxed);
                 }
             });
         }
     });
 
-    // Localise le segment contenant le n-ième premier, puis le retrouve précisément.
-    let mut restant = n;
-    let mut tampon = Vec::new();
+    // Le n-ième premier est le (n-1)-ième premier impair. On repère son segment...
+    let mut restant = n - 1;
+    let mut mots = Vec::new();
     for (i, c) in compteurs.iter().enumerate() {
         let c = c.load(Ordering::Relaxed);
-        if restant <= c {
-            let lo = i as u64 * SEGMENT;
-            let hi = ((i as u64 + 1) * SEGMENT).min(limite + 1);
-            cribler(lo, hi, &base, &mut tampon);
-            let mut vus = 0;
-            for (k, &est_premier) in tampon.iter().enumerate() {
-                if est_premier {
-                    vus += 1;
-                    if vus == restant {
-                        return lo + k as u64;
-                    }
-                }
-            }
+        if restant > c {
+            restant -= c;
+            continue;
         }
-        restant -= c.min(restant);
+        // ... puis on le retrouve précisément en recriblant ce segment.
+        let klo = i as u64 * seg_odds;
+        let khi = (klo + seg_odds).min(total_k);
+        cribler(klo, khi, &base, &motif, &mut mots);
+        for (j, &w) in mots.iter().enumerate() {
+            let mut libres = !w; // bits à 1 = premiers
+            let nb = libres.count_ones() as u64;
+            if restant > nb {
+                restant -= nb;
+                continue;
+            }
+            for _ in 1..restant {
+                libres &= libres - 1; // efface le bit de poids faible
+            }
+            let k = klo + (j as u64) * 64 + libres.trailing_zeros() as u64;
+            return 2 * k + 1;
+        }
     }
     unreachable!("la borne supérieure garantit l'existence du n-ième premier");
 }
@@ -248,7 +339,7 @@ fn executer() -> Result<String, String> {
     if args.len() != 3 {
         return Err(format!(
             "Usage : {} <n> <config>\n  config : 0 = maximum, sinon XY (X cœurs, Y threads par cœur), ex. 11, 12, 21, 22",
-            args.first().map(String::as_str).unwrap_or("nth_prime")
+            args.first().map(String::as_str).unwrap_or("burn_prems")
         ));
     }
     let n: u64 = args[1]
@@ -265,11 +356,24 @@ fn executer() -> Result<String, String> {
     let topo = detecter_topologie();
     let (cpus, desc) = choisir_cpus(&topo, config)?;
 
+    // Taille de segment réglable pour les essais : SEG_LOG2=21 burn_prems 1_000_000_000 0
+    let (seg_log2, perso) = match env::var("SEG_LOG2") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(e) if (14..=26).contains(&e) => (e, true),
+            _ => return Err(format!("SEG_LOG2='{v}' invalide : entier entre 14 et 26 attendu.")),
+        },
+        Err(_) => (SEG_LOG2_DEFAUT, false),
+    };
+
     let debut = Instant::now();
-    let p = nieme_premier(n, &cpus);
+    let p = nieme_premier(n, &cpus, 1u64 << seg_log2);
     let duree = debut.elapsed().as_secs_f64();
 
-    Ok(format!("{p}, {duree:.3}s, {desc}"))
+    if perso {
+        Ok(format!("{p}, {duree:.3}s, {desc}, segment 2^{seg_log2} bits"))
+    } else {
+        Ok(format!("{p}, {duree:.3}s, {desc}"))
+    }
 }
 
 fn main() -> ExitCode {
