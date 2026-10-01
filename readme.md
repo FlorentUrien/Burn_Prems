@@ -83,8 +83,15 @@ Pour le 10e10 nombre premiers.
 
 ## Sur le fixe
 
+252097800623, 258.490s, 1 cœur / 1 thread
+252097800623, 67.766s, 4 cœurs / 4 threads (maximum) (<mark>x3.81</mark>)
 
+## Match
 
+En 1 coeur et 1 thread : (<mark>x2.88</mark>)
 
+Au maximum: (<mark>x4.18</mark>)
+
+Cad dans l'ordre de grandeur précédent.
 
 

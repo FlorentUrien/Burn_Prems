@@ -1,1 +1,1 @@
-for c in 11 12 81 82 0; do ./target/release/burn_prems 10_000_000_000 $c; done
+for c in 11 12 81 82 0; do ./target/release/burn_prems 1_000_000_000 $c; done
